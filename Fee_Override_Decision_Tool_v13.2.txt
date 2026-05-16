@@ -1,0 +1,1811 @@
+// ==UserScript==
+// @name         Amazon Fee Override Pro Tool
+// @namespace    http://tampermonkey.net/
+// @version      13.0
+// @description  v11.7: Migrated from deprecated hubble.amazon.dev to DataCentral Workbench (datacentral.a2z.com/workbench). Both URLs supported during transition period.
+// @match        https://t.corp.amazon.com/*
+// @match        https://datacentral.a2z.com/*
+// @match        https://crisp.cors.amazon.dev/*
+// @match        https://portal.prod.na.integrity.fee.selling-partners.amazon.dev/*
+// @match        https://portal.prod.eu.integrity.fee.selling-partners.amazon.dev/*
+// @match        https://portal.prod.fe.integrity.fee.selling-partners.amazon.dev/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+/* ============================================================
+   HOW THIS WORKS (v13)
+   ─────────────────────────────────────────────────────────────
+   MORNING SETUP (Once for all 80 tickets):
+     1. User uploads daily ASIN file (xlsx or csv) with
+        columns: ASIN, Marketplace_ID
+     2. Script reads all ASIN+Marketplace pairs
+     3. Builds one DataCentral query with all ASINs
+     4. Opens DataCentral, runs query once
+     5. Captures all current fee categories
+     6. Stores in GM_setValue (persists across sessions)
+
+   DURING TICKET PROCESSING (No DataCentral needed):
+     1. Open any ticket
+     2. Script reads ASIN + Marketplace from ticket
+     3. Looks up cached data instantly
+     4. Compares with proposed fee category
+     5. Gives decision immediately
+   ============================================================ */
+
+(function () {
+    'use strict';
+
+    // =========================================================
+    // ROUTE: which page are we on?
+    // =========================================================
+    if (location.hostname === 'datacentral.a2z.com') {
+        runHubbleSide();
+        return;
+    }
+
+    if (location.hostname === 'crisp.cors.amazon.dev') {
+        runCrispSide();
+        return;
+    }
+
+    if (location.hostname.includes('integrity.fee.selling-partners.amazon.dev')) {
+        runBadCatAutoFill();
+        return;
+}
+
+    runTicketSide();
+
+
+    // =========================================================
+    //  TICKET SIDE
+    // =========================================================
+    let manualAsins = []; // ASINs loaded from file upload in Step 4
+    function runTicketSide() {
+
+        let feeData = []; // Fees master file data
+        let cachedAsins = []; // Persistent cache from DataCentral batch run
+        let lastUrl = location.href;
+        let pollTimer = null;
+
+        // ─────────────────────────────────────────────────────
+        // NORMALIZE
+        // ─────────────────────────────────────────────────────
+        function normalize(text) {
+            let value = String(text || '')
+                .trim()
+                .toLowerCase()
+                .replace(/&/g, 'and')
+                .replace(/[_-]+/g, ' ')
+                .replace(/\s+/g, ' ')
+                .replace(/[^\w\s]/g, '')
+                .trim();
+
+            const aliases = {
+                "full size appliances"       : "full size appliances",
+                "fullsize appliances"         : "full size appliances",
+                "electronic accessories"      : "electronic accessories",
+                "electronics accessories"     : "electronic accessories",
+                "beauty health personal care" : "beauty health and personal care",
+                "tyres" : "tires",
+                "tyre"  : "tires",
+                "tire"  : "tires",
+                "tires" : "tires"
+            };
+
+            return aliases[value] || value;
+        }
+
+        // ─────────────────────────────────────────────────────
+        // CSV PARSER
+        // ─────────────────────────────────────────────────────
+        function csvToJson(text) {
+            const rows = [];
+            const lines = text.trim().split(/\r?\n/);
+            if (!lines.length) return rows;
+
+            function parseLine(line) {
+                const result = [];
+                let current = '';
+                let inQuotes = false;
+                for (let i = 0; i < line.length; i++) {
+                    const ch = line[i];
+                    const next = line[i + 1];
+                    if (ch === '"') {
+                        if (inQuotes && next === '"') { current += '"'; i++; }
+                        else inQuotes = !inQuotes;
+                    } else if (ch === ',' && !inQuotes) {
+                        result.push(current.trim());
+                        current = '';
+                    } else {
+                        current += ch;
+                    }
+                }
+                result.push(current.trim());
+                return result;
+            }
+
+            const headers = parseLine(lines[0]);
+            for (let i = 1; i < lines.length; i++) {
+                if (!lines[i].trim()) continue;
+                const values = parseLine(lines[i]);
+                const obj = {};
+                headers.forEach((h, idx) => { obj[h.trim()] = (values[idx] || '').trim(); });
+                rows.push(obj);
+            }
+            return rows;
+        }
+
+
+        // ─────────────────────────────────────────────────────
+        // STORAGE (GM_setValue + localStorage fallback)
+        // ─────────────────────────────────────────────────────
+        async function saveData(key, data) {
+            const txt = JSON.stringify(data);
+            await GM_setValue(key, txt);
+            try { localStorage.setItem(key, txt); } catch(e) {}
+        }
+
+        async function loadData(key) {
+            try {
+                const val = await GM_getValue(key, '') ||
+                            localStorage.getItem(key) || '';
+                return val ? JSON.parse(val) : null;
+            } catch(e) { return null; }
+        }
+
+        async function clearData(key) {
+            await GM_deleteValue(key);
+            try { localStorage.removeItem(key); } catch(e) {}
+        }
+
+        async function restoreAllSavedData() {
+            feeData = (await loadData('feeOverride_feeData')) || [];
+            cachedAsins = (await loadData('feeOverride_asinCache')) || [];
+        }
+
+        // ─────────────────────────────────────────────────────
+        // HELPERS
+        // ─────────────────────────────────────────────────────
+        function getValue(row, keys) {
+            for (const actual of Object.keys(row)) {
+                for (const wanted of keys) {
+                    if (normalize(actual) === normalize(wanted)) return row[actual];
+                }
+            }
+            return '';
+        }
+
+        function findCurrentFee(mp, asin) {
+            const row = cachedAsins.find(item =>
+                normalize(String(getValue(item, ['marketplace_id', 'Marketplace_ID', 'Marketplace ID', 'marketplace']))) === normalize(String(mp)) &&
+                normalize(getValue(item, ['asin', 'ASIN'])) === normalize(asin)
+            );
+            if (!row) return null;
+            return getValue(row, ['fee_category_name', 'Current Fee Category', 'Current_Fee_Category']);
+        }
+
+        function findRate(mp, category) {
+            const targetMp = normalize(mp);
+            const targetCat = normalize(category);
+
+            const row = feeData.find(item => {
+                const rowMp = normalize(getValue(item, ['Marketplace', 'Marketplace_ID', 'Marketplace ID']));
+                const rowCat = normalize(getValue(item, ['Seller facing Fee Category', 'Fee Category']));
+                return rowMp === targetMp &&
+                    (rowCat === targetCat || rowCat.includes(targetCat) || targetCat.includes(rowCat));
+            });
+
+            if (!row) return null;
+
+            const raw = String(getValue(row, ['Fee %', 'Fee%'])).trim();
+            if (!raw) return null;
+
+            const lower = raw.toLowerCase();
+            const values = [];
+            const regex = /(\d+(?:\.\d+)?)\s*%/g;
+            let m;
+            while ((m = regex.exec(raw)) !== null) values.push(parseFloat(m[1]));
+            if (!values.length) return null;
+
+            const min = Math.min(...values);
+            const max = Math.max(...values);
+            let note = '';
+            let type = 'normal';
+
+            if (lower.includes('(tiered)')) { type = 'tiered'; note = "This is a tiered fee rate case, please check the price and ascertain the Fee Category."; }
+            else if (lower.includes('(total)')) { type = 'total'; note = "Please check whether it's a bundled product."; }
+            else if (lower.includes('except')) { type = 'exception'; note = "This fee category has exception-based rates, please verify manually."; }
+            else if (values.length > 1) { type = 'multi'; note = "Multiple fee rates found, please verify manually."; }
+
+            return { rate: max, min, max, raw, note, type };
+        }
+
+        // ─────────────────────────────────────────────────────
+        // BUILD DataCentral QUERY from ASIN pairs
+        // ─────────────────────────────────────────────────────
+        function buildBatchQuery(pairs, snapshotOffset = 4) {
+            // pairs = [{ asin, marketplace_id }, ...]
+            // snapshotOffset: 2, 3 or 4 — auto-retried by DataCentral side if no results
+            const inClause = pairs.map(p => `('${p.asin}', '${p.marketplace_id}')`).join(',\n');
+            const uniqueMarketplaces = [...new Set(pairs.map(p => p.marketplace_id))];
+            const mpClause = uniqueMarketplaces.map(mp => `'${mp}'`).join(', ');
+            return `WITH asin_data AS (
+    SELECT
+        marketplace_id,
+        snapshot_day,
+        asin,
+        gl_product_group,
+        trex_id,
+        catset_itk_set,
+        catset_bn_set,
+        fee_category_id,
+        decisiveid_type
+    FROM ANDES_EXT.SPS_TREX.D_ASIN_TO_FEE_CATEGORY_ID_WITH_CONTEXT
+    WHERE (asin, marketplace_id) IN (
+${inClause}
+) AND snapshot_day = CURRENT_DATE - ${snapshotOffset}
+),
+fee_cat_mapping AS (
+    SELECT
+        region_id,
+        marketplace_id,
+        fee_category_id,
+        fee_category_name,
+        status
+    FROM (
+        SELECT
+            region_id,
+            marketplace_id,
+            fee_category_id,
+            fee_category_name,
+            status,
+            ROW_NUMBER() OVER(PARTITION BY marketplace_id, fee_category_id
+                            ORDER BY effective_date DESC) as row_num
+        FROM andes.sps_trex.d_fee_categories
+        WHERE region_id IN (1, 2, 3)
+        AND marketplace_id IN (${mpClause})
+        AND status NOT IN ('INACTIVE')
+    )
+    WHERE row_num = 1
+        AND status NOT IN ('DELETED')
+)
+SELECT
+    a.marketplace_id,
+    a.asin,
+    a.fee_category_id,
+    f.fee_category_name,
+    a.decisiveid_type,
+    CASE
+        WHEN a.decisiveid_type = 'TREX' THEN 'TREX-based'
+        ELSE 'GL-based (Fallback)'
+    END as categorization_method,
+    a.trex_id,
+    a.gl_product_group,
+    a.catset_itk_set,
+    a.catset_bn_set
+FROM asin_data a
+LEFT JOIN fee_cat_mapping f
+    ON a.marketplace_id = f.marketplace_id
+    AND a.fee_category_id = f.fee_category_id
+ORDER BY a.marketplace_id, a.asin;`;
+        }
+
+        // ─────────────────────────────────────────────────────
+        // LOAD DAILY ASIN BATCH FILE (CSV only)
+        // ─────────────────────────────────────────────────────
+        async function loadBatchFile(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            if (!file.name.toLowerCase().endsWith('.csv')) {
+                setBatchStatus('❌ Please upload a CSV file. To convert: open your Excel file → File → Save As → CSV (Comma delimited).', '#dc2626');
+                e.target.value = '';
+                return;
+            }
+
+            setBatchStatus('⏳ Reading file...', '#d97706');
+
+            try {
+                let pairs = [];
+                const text = await readFileAsText(file);
+                const rows = csvToJson(text);
+                pairs = extractPairs(rows);
+
+                if (!pairs.length) {
+                    setBatchStatus('❌ No valid ASIN + Marketplace_ID pairs found in file.', '#dc2626');
+                    return;
+                }
+
+                // Remove duplicates
+                const unique = [];
+                const seen = new Set();
+                for (const p of pairs) {
+                    const key = p.asin + '|' + p.marketplace_id;
+                    if (!seen.has(key)) { seen.add(key); unique.push(p); }
+                }
+
+                setBatchStatus(`✅ File loaded: ${unique.length} unique ASIN pairs found. Click "Run Batch DataCentral Query" to fetch fee categories.`, '#15803d');
+                updateBatchCount(unique.length);
+
+                // Store pairs temporarily for the DataCentral run
+                await saveData('feeOverride_batchPairs', unique);
+
+            } catch (err) {
+                setBatchStatus('❌ Error reading file: ' + err.message, '#dc2626');
+            }
+
+            // Reset file input so same file can be re-uploaded if needed
+            e.target.value = '';
+        }
+
+        function extractPairs(rows) {
+            const pairs = [];
+            for (const row of rows) {
+                // Find ASIN column — matches any column containing "asin" in its name
+                const asinKey = Object.keys(row).find(k => k.toLowerCase().includes('asin'));
+                const rawAsin = (asinKey ? row[asinKey] : '').trim();
+
+                // Find Marketplace column — matches any column containing "marketplace" in its name
+                const mpKey = Object.keys(row).find(k => k.toLowerCase().includes('marketplace'));
+                const mp = String(mpKey ? row[mpKey] : '').trim();
+
+                if (!mp) continue;
+
+        // Check if the ASIN cell contains multiple ASINs
+        // (separated by commas, spaces, or newlines)
+                const asinPattern = /B0[A-Z0-9]{8,9}/gi;
+                const foundAsins = rawAsin.match(asinPattern);
+
+        if (foundAsins && foundAsins.length > 1) {
+            // Multiple ASINs in one cell — split and pair each with same marketplace
+            for (const asin of foundAsins) {
+                pairs.push({ asin: asin.toUpperCase(), marketplace_id: mp });
+            }
+        } else if (foundAsins && foundAsins.length === 1) {
+            // Single ASIN — normal case
+            pairs.push({ asin: foundAsins[0].toUpperCase(), marketplace_id: mp });
+        } else if (rawAsin) {
+            // Fallback — use as is (handles edge cases)
+            pairs.push({ asin: rawAsin.toUpperCase(), marketplace_id: mp });
+        }
+    }
+    return pairs.filter(p => p.asin && p.marketplace_id);
+}
+
+        function readFileAsText(file) {
+            return new Promise((resolve, reject) => {
+                const r = new FileReader();
+                r.onload = () => resolve(r.result);
+                r.onerror = () => reject(new Error('Failed to read file'));
+                r.readAsText(file);
+            });
+        }
+
+        // ─────────────────────────────────────────────────────
+        // RUN BATCH DataCentral QUERY
+        // ─────────────────────────────────────────────────────
+        async function runBatchHubble() {
+            const pairs = await loadData('feeOverride_batchPairs');
+
+            if (!pairs || !pairs.length) {
+                setBatchStatus('❌ Please upload the daily ASIN file first.', '#dc2626');
+                return;
+            }
+
+
+
+            const query = buildBatchQuery(pairs);
+
+            // Store job for DataCentral tab
+            // Start with offset 2 — DataCentral side will auto retry with 3, 4 if empty
+            await GM_setValue('hubbleJob_query', query);
+            await GM_setValue('hubbleJob_status', 'pending');
+            await GM_setValue('hubbleJob_result', '');
+            await GM_setValue('hubbleJob_error', '');
+            await GM_setValue('hubbleJob_snapshotDay', '');
+            await GM_setValue('hubbleJob_pairs', JSON.stringify(pairs));
+
+            setBatchStatus(`⏳ Opening DataCentral for ${pairs.length} ASINs... please wait, do not close the DataCentral tab.`, '#d97706');
+
+            window.open('https://datacentral.a2z.com/workbench', '_blank');
+
+            startPolling(pairs.length);
+        }
+
+        // ─────────────────────────────────────────────────────
+        // POLL FOR DataCentral RESULTS
+        // ─────────────────────────────────────────────────────
+        function startPolling(totalAsins) {
+            if (pollTimer) clearInterval(pollTimer);
+
+            let elapsed = 0;
+            const MAX = 1200; // polling timeout
+
+            pollTimer = setInterval(async () => {
+                elapsed += 3;
+
+                const status = await GM_getValue('hubbleJob_status', '');
+                const error = await GM_getValue('hubbleJob_error', '');
+
+                if (status === 'done') {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+
+                    const raw = await GM_getValue('hubbleJob_result', '');
+                    if (!raw) {
+                        setBatchStatus('❌ DataCentral returned empty results. Try changing snapshot_day to -3 or -4.', '#dc2626');
+                        return;
+                    }
+
+                    try {
+                        const fetched = JSON.parse(raw);
+                        const snapshotDay = await GM_getValue('hubbleJob_snapshotDay', '');
+
+                        // Merge with existing cache (in case of partial re-runs)
+                        const existing = cachedAsins || [];
+                        const mergedMap = new Map();
+
+                        // Add existing first
+                        for (const item of existing) {
+                            const key = item.asin + '|' + item.marketplace_id;
+                            mergedMap.set(key, item);
+                        }
+                        // Overwrite/add new fetched data
+                        for (const item of fetched) {
+                            const key = item.asin + '|' + item.marketplace_id;
+                            mergedMap.set(key, item);
+                        }
+
+                        cachedAsins = [...mergedMap.values()];
+
+                        // Save with timestamp and snapshot day
+                        await saveData('feeOverride_asinCache', cachedAsins);
+                        await saveData('feeOverride_cacheTime', {
+                            time        : new Date().toLocaleString(),
+                            count       : cachedAsins.length,
+                            snapshotDay : snapshotDay
+                        });
+
+                        updateCacheStatus();
+                        setBatchStatus(
+                            `✅ Done! ${fetched.length} ASINs fetched from DataCentral. Total cache: ${cachedAsins.length} ASINs. You can now process all tickets.` +
+                            (snapshotDay ? ` · Snapshot Day: ${snapshotDay}` : ''),
+                            '#15803d'
+                        );
+
+                    } catch (e) {
+                        setBatchStatus('❌ Failed to parse DataCentral results: ' + e.message, '#dc2626');
+                    }
+
+                } else if (status === 'error') {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    setBatchStatus('❌ DataCentral error: ' + error, '#dc2626');
+
+                } else if (elapsed >= MAX) {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    setBatchStatus('❌ Timed out. DataCentral took too long. Try again or reduce ASIN count.', '#dc2626');
+
+                } else {
+                    // Show chunk progress if available
+                    const chunkInfo = status.startsWith('running|') ? status.replace('running|', '') : '';
+                    const chunkMsg = chunkInfo ? ` — ${chunkInfo}` : '';
+                    setBatchStatus(`⏳ Fetching ${totalAsins} ASINs from DataCentral${chunkMsg}... (${elapsed}s elapsed)`, '#d97706');
+                }
+            }, 3000);
+        }
+
+        // ─────────────────────────────────────────────────────
+        // LOAD FEE MASTER FILE
+        // ─────────────────────────────────────────────────────
+        async function loadFeeFile(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            if (!file.name.toLowerCase().endsWith('.csv')) {
+                alert('❌ Please upload a CSV file. To convert: open your Excel file → File → Save As → CSV (Comma delimited).');
+                e.target.value = '';
+                return;
+            }
+
+            try {
+                const text = await readFileAsText(file);
+                const json = csvToJson(text);
+                feeData = json;
+                await saveData('feeOverride_feeData', json);
+                updateFeeStatus();
+                alert(`✅ ${file.name} loaded successfully. (${json.length} rows)`);
+            } catch (err) {
+                alert('❌ Failed to load fee file: ' + err.message);
+            }
+            e.target.value = '';
+        }
+
+        async function clearFeeFile() {
+            feeData = [];
+            await clearData('feeOverride_feeData');
+            updateFeeStatus();
+        }
+
+
+
+        async function clearCache() {
+            if (!confirm('Clear the ASIN cache? You will need to run the batch DataCentral query again.')) return;
+            cachedAsins = [];
+            await clearData('feeOverride_asinCache');
+            await clearData('feeOverride_cacheTime');
+            await clearData('feeOverride_batchPairs');
+            updateCacheStatus();
+            setBatchStatus('🗑️ Cache cleared. Please upload the daily ASIN file and run the batch query again.', '#6b7280');
+        }
+
+        function downloadCache() {
+    if (!cachedAsins.length) {
+        alert('No cache data to download.');
+        return;
+    }
+
+    // Load the original batch pairs to identify missing ASINs
+    loadData('feeOverride_batchPairs').then(batchPairs => {
+        const rows = ['ASIN,Marketplace_ID,Fee_Category_Name,Status'];
+
+        // Add retrieved ASINs
+        for (const item of cachedAsins) {
+            const asin = item.asin || '';
+            const mp = item.marketplace_id || '';
+            const cat = (item.fee_category_name || '').replace(/,/g, ';');
+            rows.push(`${asin},${mp},${cat},Retrieved`);
+        }
+
+        // Add missing ASINs if batch pairs exist
+        if (batchPairs && batchPairs.length) {
+            const retrievedKeys = new Set(
+                cachedAsins.map(item => item.asin + '|' + item.marketplace_id)
+            );
+            for (const pair of batchPairs) {
+                const key = pair.asin + '|' + pair.marketplace_id;
+                if (!retrievedKeys.has(key)) {
+                    rows.push(`${pair.asin},${pair.marketplace_id},NOT FOUND,Missing`);
+                }
+            }
+        }
+
+        const csv = rows.join('\n');
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `fee_override_cache_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+    });
+}
+
+        // ─────────────────────────────────────────────────────
+        // PAGE READER
+        // ─────────────────────────────────────────────────────
+        function readPage() {
+            const txt = (document.body?.innerText || '') + '\n' + (document.title || '');
+
+            const asinMatches = [...txt.matchAll(/\bB0[A-Z0-9]{8,9}\b/gi)].map(m => m[0].toUpperCase());
+            const uniqueAsins = [...new Set(asinMatches)];
+
+            const mpMatch =
+                txt.match(/Marketplace\s*ID\s*[-:]\s*(\d+)/i) ||
+                txt.match(/Marketplace_ID\s*[-:]\s*(\d+)/i);
+
+            const propMatch =
+                txt.match(/Proposed\s*Implementation\s*fee\s*Category\s*[:\-]\s*([^\n\r]+)/i) ||
+                txt.match(/\[Fee\s*Category\s*change\s*request\s*to\s*([^\]]+)\]/i);
+
+            const asinEl = document.getElementById('fotAsinVal');
+            const mpEl = document.getElementById('fotMpVal');
+            const propEl = document.getElementById('fotPropVal');
+
+            if (asinEl) asinEl.textContent = uniqueAsins.length ? uniqueAsins.join(', ') : 'Not Found';
+            if (mpEl) mpEl.textContent = mpMatch ? mpMatch[1] : 'Not Found';
+            if (propEl) propEl.textContent = propMatch ? propMatch[1].trim() : 'Not Found';
+
+            fotUpdateAsinCount();
+
+// Extract Case ID and Seller ID for BadCat auto-fill
+var caseIdMatch = txt.match(/\[Case\s*ID:\s*(\d+)\]/i);
+if (caseIdMatch && caseIdMatch[1]) {
+    GM_setValue('extractedCaseId', caseIdMatch[1]);
+}
+var sellerIdMatch = txt.match(/\[Seller\s*ID:\s*(\d+)\]/i);
+if (sellerIdMatch && sellerIdMatch[1]) {
+    GM_setValue('extractedSellerId', sellerIdMatch[1]);
+}
+}
+
+        // ─────────────────────────────────────────────────────
+        // UI HELPERS
+        // ─────────────────────────────────────────────────────
+        function show(html, color = '#111827') {
+            const el = document.getElementById('fotResult');
+            if (!el) return;
+            el.style.color = color;
+            el.innerHTML = html;
+        }
+
+        function setBatchStatus(msg, color) {
+            const el = document.getElementById('fotBatchStatus');
+            if (el) { el.textContent = msg; el.style.color = color || '#1d4ed8'; }
+        }
+
+        function updateFeeStatus() {
+            const el = document.getElementById('fotFeeStatus');
+            if (el) el.textContent = feeData.length ? `✅ Loaded: ${feeData.length} rows` : '⚠️ Not loaded';
+        }
+
+        function updateBatchCount(count) {
+            const el = document.getElementById('fotBatchCount');
+            if (el) el.textContent = count ? `📋 ${count} ASIN pairs ready` : '';
+        }
+
+        async function updateCacheStatus() {
+            const meta = await loadData('feeOverride_cacheTime');
+            const el = document.getElementById('fotCacheStatus');
+            if (!el) return;
+            if (cachedAsins.length) {
+               el.innerHTML = `✅ Cache: <b>${cachedAsins.length}</b> ASINs stored` +
+    (meta ? ` · Last updated: ${meta.time}` : '') +
+    (meta?.snapshotDay ? ` · Snapshot Day: ${meta.snapshotDay}` : '');
+                el.style.color = '#15803d';
+            } else {
+                el.textContent = '⚠️ No cache yet — run batch query first';
+                el.style.color = '#d97706';
+            }
+        }
+
+        function renderAsinDetails(rows) {
+            const box = document.getElementById('fotAsinDetailsContent');
+            if (!box) return;
+            if (!rows || !rows.length) {
+                box.innerHTML = '<span style="color:#64748b;">No fee details available.</span>';
+                return;
+            }
+            box.innerHTML = rows.map(item => `
+                <div style="margin-bottom:8px;padding:8px 10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;font-size:13px;">
+                    <div><b>${item.asin}</b></div>
+                    <div style="margin-top:3px;color:#475569;">Current: <b>${item.currentFee}</b> (${item.currentDisplay})</div>
+                    <div style="color:#475569;">Proposed: <b>${item.proposedFee}</b> (${item.proposedDisplay})</div>
+                </div>
+            `).join('');
+        }
+
+        // ─────────────────────────────────────────────────────
+        // ASIN PROCESSOR — BadCat & CRISP
+        // ─────────────────────────────────────────────────────
+        const FOT_MAX_BADCAT = 100;
+        const FOT_MAX_CRISP = 500;
+
+        const FOT_CRISP_MP_MAP = {
+            'US':'1','CA':'7','MX':'771770','BR':'526970',
+            'UK':'3','DE':'4','FR':'5','IT':'35691','ES':'44551',
+            'IN':'44571','EG':'623225021','AE':'338801','SA':'338811',
+            'TR':'338851','NL':'328451','BE':'679831071','PL':'712115121',
+            'SE':'704403121','AU':'111172','JP':'6','SG':'104444012','IE':'680844071'
+        };
+
+        const FOT_MP_ID_TO_CODE = {
+            '1':'US','7':'CA','526970':'BR','771770':'MX',
+            '3':'UK','4':'DE','44551':'ES','35691':'IT','5':'FR',
+            '328451':'NL','679831071':'BE','704403121':'SE','712115121':'PL',
+            '753556201':'IE','338801':'AE','338811':'SA','338851':'TR',
+            '623225021':'EG','6':'JP','104444012':'SG','111172':'AU'
+        };
+
+        const FOT_MP_CODE_TO_NAME = {
+            'US':'United States','CA':'Canada','BR':'Brazil','MX':'Mexico',
+            'UK':'United Kingdom','DE':'Germany','ES':'Spain','IT':'Italy',
+            'FR':'France','NL':'Netherlands','BE':'Belgium','SE':'Sweden',
+            'PL':'Poland','IE':'Ireland','AE':'Arab Emirates','SA':'Saudi Arabia',
+            'TR':'Turkey','EG':'Egypt','JP':'Japan','SG':'Singapore','AU':'Australia'
+        };
+
+        function fotUpdateRegion(mpCode) {
+            const el = document.getElementById('fotRegion');
+            if (!el) return;
+            if (['US','CA','MX','BR'].includes(mpCode)) el.value = 'na';
+            else if (['UK','DE','FR','IT','ES','IN','EG','AE','SA','TR','NL','BE','PL','SE','IE'].includes(mpCode)) el.value = 'eu';
+            else if (['AU','JP','SG'].includes(mpCode)) el.value = 'fe';
+        }
+
+        function fotGetAsins() {
+    const asinText = document.getElementById('fotAsinVal')?.textContent || '';
+    if (asinText && asinText !== '-' && asinText !== 'Not Found') {
+        return asinText.split(',').map(a => a.trim()).filter(Boolean);
+    }
+    if (manualAsins.length) return manualAsins;
+    return [...new Set((document.body.innerText.match(/B0[A-Z0-9]{8}/g) || []))];
+}
+
+        function fotAutoDetectMarketplace() {
+            const mpId = (document.getElementById('fotMpVal')?.textContent || '').trim();
+            const mpCode = FOT_MP_ID_TO_CODE[mpId] || null;
+
+            const mpSelect = document.getElementById('fotMpSelect');
+            const mpDetected = document.getElementById('fotMpDetected');
+            const regionInput= document.getElementById('fotRegion');
+
+            if (mpCode) {
+                if (mpSelect) mpSelect.value = mpCode;
+                if (regionInput) fotUpdateRegion(mpCode);
+                const fullName = FOT_MP_CODE_TO_NAME[mpCode] || mpCode;
+                if (mpDetected) {
+                    mpDetected.textContent = `🌍 ${mpCode} — ${fullName} (auto-detected)`;
+                    mpDetected.style.color = '#15803d';
+                    mpDetected.style.background = '#f0fdf4';
+                    mpDetected.style.borderColor= '#bbf7d0';
+                }
+            } else {
+                if (mpDetected) {
+                    mpDetected.textContent = mpId
+                        ? `⚠️ Marketplace ID ${mpId} not recognized`
+                        : '⚠️ Marketplace not detected from ticket';
+                    mpDetected.style.color = '#d97706';
+                    mpDetected.style.background = '#fffbeb';
+                    mpDetected.style.borderColor= '#fde68a';
+                }
+            }
+        }
+
+        function fotUpdateAsinCount() {
+            const asins = fotGetAsins();
+            const el = document.getElementById('fotAsinProcessorCount');
+            if (!el) return;
+            const badcatBatches = Math.ceil(asins.length / FOT_MAX_BADCAT);
+            const crispBatches = Math.ceil(asins.length / FOT_MAX_CRISP);
+            if (asins.length === 0) {
+                el.textContent = 'No ASINs found on page'; el.style.color = '#999';
+            } else if (asins.length > FOT_MAX_CRISP) {
+                el.textContent = `${asins.length} ASINs (BadCat: ${badcatBatches} tabs, CRISP: ${crispBatches} tabs)`;
+                el.style.color = '#d68000';
+            } else if (asins.length > FOT_MAX_BADCAT) {
+                el.textContent = `${asins.length} ASINs (BadCat: ${badcatBatches} tabs)`;
+                el.style.color = '#d68000';
+            } else {
+                el.textContent = `${asins.length} ASIN${asins.length > 1 ? 's' : ''} detected`;
+                el.style.color = '#16a34a';
+            }
+            fotAutoDetectMarketplace();
+        }
+
+        function fotProcessBadCat() {
+            const mpValue = document.getElementById('fotMpSelect')?.value;
+            const regionValue = document.getElementById('fotRegion')?.value;
+            const asins = fotGetAsins();
+            if (!mpValue) { alert('Marketplace could not be detected from this ticket.'); return; }
+            if (!asins.length) { alert('No ASINs found on this ticket page.'); return; }
+
+            const batches = [];
+            for (let i = 0; i < asins.length; i += FOT_MAX_BADCAT) {
+                batches.push(asins.slice(i, i + FOT_MAX_BADCAT));
+            }
+            batches.forEach((batch, index) => {
+                let url;
+                if (batch.length === 1) {
+                    url = `https://portal.prod.${regionValue}.integrity.fee.selling-partners.amazon.dev/badcat?marketplace=${mpValue}&asin=${batch[0]}`;
+                } else {
+                    url = `https://portal.prod.${regionValue}.integrity.fee.selling-partners.amazon.dev/badcat/batch?marketplace=${mpValue}&asins=${batch.join('%0A')}`;
+                }
+                setTimeout(() => window.open(url, '_blank'), index * 300);
+            });
+            if (batches.length > 1) alert(`Opening ${batches.length} BadCat tabs (${asins.length} ASINs in batches of ${FOT_MAX_BADCAT})`);
+        }
+
+        function fotProcessCRISP() {
+            const mpValue = document.getElementById('fotMpSelect')?.value;
+            const asins = fotGetAsins();
+            if (!asins.length) { alert('No ASINs found on this ticket page.'); return; }
+            const crispMpId = FOT_CRISP_MP_MAP[mpValue];
+            if (!crispMpId) { alert(`CRISP marketplace ID not found for ${mpValue}`); return; }
+
+            const batches = [];
+            for (let i = 0; i < asins.length; i += FOT_MAX_CRISP) {
+                batches.push(asins.slice(i, i + FOT_MAX_CRISP));
+            }
+            batches.forEach((batch, index) => {
+                const encodedAsins = btoa(batch.join('%0A') + '%0A');
+                const crispUrl = `https://crisp.cors.amazon.dev/?textareaValue=${encodedAsins}&pageSize=500&mp=${crispMpId}&selectedAttributes=item_name%2Cbullet_point%2Cgeneric_keyword%2Cgl_product_group_type%2Citem_type_keyword%2Cproduct_type%2Cbrowse_nodes&isImageRequired=true&selectedAsinSearchOptions=%7B%22variationParentOnly%22%3Afalse%2C%22websiteSearchable%22%3Afalse%2C%22retailAsins%22%3Afalse%7D`;
+                setTimeout(() => window.open(crispUrl, '_blank'), index * 300);
+            });
+            if (batches.length > 1) alert(`Opening ${batches.length} CRISP tabs (${asins.length} ASINs in batches of ${FOT_MAX_CRISP})`);
+        }
+
+        function fotHandleAsinFileUpload(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+        const text = evt.target.result;
+        const asinPattern = /B0[A-Z0-9]{8,9}/gi;
+        const found = [...new Set((text.match(asinPattern) || []).map(a => a.toUpperCase()))];
+        manualAsins = found;
+        fotUpdateAsinCount();
+    };
+    reader.readAsText(file);
+}
+
+        // ─────────────────────────────────────────────────────
+        // MAIN DECISION LOGIC
+        // ─────────────────────────────────────────────────────
+        function runLogic() {
+            readPage();
+
+            const asinText = document.getElementById('fotAsinVal').textContent;
+            const mp = document.getElementById('fotMpVal').textContent;
+            const proposed = document.getElementById('fotPropVal').textContent;
+
+            if ([asinText, mp, proposed].includes('Not Found')) {
+                show('❌ Could not read ASIN / Marketplace / Proposed Fee from page.', '#dc2626');
+                return;
+            }
+
+            if (!feeData.length) {
+                show('❌ Please upload the Fees Master file first.', '#dc2626');
+                return;
+            }
+
+            if (!cachedAsins.length) {
+                show('❌ No ASIN cache found. Please upload the daily ASIN file and run the batch DataCentral query first.', '#dc2626');
+                return;
+            }
+
+            const asins = asinText.split(',').map(x => x.trim()).filter(Boolean);
+            const detailRows = [];
+
+            // ── SINGLE ASIN ──────────────────────────────────
+            if (asins.length === 1) {
+                const asin = asins[0];
+                const currentFee = findCurrentFee(mp, asin);
+
+                if (!currentFee) {
+                    show(`⚠️ ASIN <b>${asin}</b> not found in cache. It may not have been in today's batch file. Do manual check.`, '#d97706');
+                    return;
+                }
+
+                const currentObj = findRate(mp, currentFee);
+                const proposedObj = findRate(mp, proposed);
+
+                if (!currentObj || !proposedObj) {
+                    show('❌ Fee % not found in Fees Master file for one or both categories.', '#dc2626');
+                    return;
+                }
+
+                detailRows.push({
+                    asin,
+                    currentFee,
+                    currentDisplay : currentObj.raw,
+                    proposedFee    : proposed,
+                    proposedDisplay: proposedObj.raw
+                });
+
+                renderAsinDetails(detailRows);
+
+                // Truly safe only if proposed max never exceeds current fee in any price scenario
+                // If current is tiered/total, the minimum tier rate is what matters for comparison
+                // e.g. Current Jewelry 5%/20% tiered, Proposed 12% → 12 > 5 → unsafe at high price
+
+                const safe = proposedObj.max <= currentObj.max && proposedObj.min <= currentObj.min;
+                const notes = [];
+                // Only show warnings when:
+                // 1. Categories are different AND
+                // 2. It is actually UNSAFE (proposed max > current max)
+                // If safe — proposed never exceeds current in any scenario — no warning needed
+                // e.g. Current total (5%/15%), Proposed total (5%/10%) → safe, no total warning
+                // e.g. Current tiered (8%/15%), Proposed flat 8% → safe, no tiered warning
+                const categoriesAreDifferent = normalize(currentFee) !== normalize(proposed);
+                const hasPartialRisk = categoriesAreDifferent && proposedObj.max > currentObj.min;
+                if (!safe && categoriesAreDifferent) {
+                    if (proposedObj.note) notes.push(proposedObj.note);
+                    if (currentObj.note && currentObj.note !== proposedObj.note) notes.push(currentObj.note);
+                }
+
+                show(`
+                    Current Fee Category: <b>${currentFee}</b> (${currentObj.raw})
+                    <br>Proposed Fee Category: <b>${proposed}</b> (${proposedObj.raw})
+                    <br><br>
+                    ${safe
+                        ? '✅ Safe to override! Yet please check whether the proposed fee category is right.'
+                        : "⚠️ Caution!! Don't override. Yet please check whether the proposed fee category is right."}
+                    ${notes.length ? '<br><br>ℹ️ ' + notes.join('<br>ℹ️ ') : ''}
+                `, safe ? '#15803d' : '#d97706');
+
+                return;
+            }
+
+            // ── BULK ASINs ────────────────────────────────────
+            const proposedObj = findRate(mp, proposed);
+            if (!proposedObj) {
+                show('❌ Proposed Fee % not found in Fees Master file.', '#dc2626');
+                return;
+            }
+
+            const safeList = [];
+            const unsafeList = [];
+            const missingList= [];
+            const notes = [];
+
+            for (const asin of asins) {
+                const currentFee = findCurrentFee(mp, asin);
+                if (!currentFee) { missingList.push(asin); continue; }
+
+                const currentObj = findRate(mp, currentFee);
+                if (!currentObj) { missingList.push(asin); continue; }
+
+                detailRows.push({
+                    asin,
+                    currentFee,
+                    currentDisplay : currentObj.raw,
+                    proposedFee    : proposed,
+                    proposedDisplay: proposedObj.raw
+                });
+
+                const categoriesAreDifferent = normalize(currentFee) !== normalize(proposed);
+                if (proposedObj.max <= currentObj.max && proposedObj.min <= currentObj.min) {
+                    safeList.push(asin);
+                } else {
+                    unsafeList.push(asin);
+                    if (categoriesAreDifferent) {
+                        if (proposedObj.note) notes.push(proposedObj.note);
+                        if (currentObj.note && currentObj.note !== proposedObj.note) notes.push(currentObj.note);
+    }
+}
+            }
+
+            renderAsinDetails(detailRows);
+            const uniqueNotes = [...new Set(notes)];
+
+            if (missingList.length === asins.length) {
+                show(`⚠️ None of the ASINs found in cache: ${missingList.join(', ')}. Please check the batch file.`, '#d97706');
+                return;
+            }
+            if (unsafeList.length === 0 && safeList.length > 0) {
+                show(`✅ All ASINs are safe to override! Yet please check whether the proposed fee category is right.
+                    ${missingList.length ? '<br><br>⚠️ Not in cache: ' + missingList.join(', ') : ''}
+                    ${uniqueNotes.length ? '<br><br>ℹ️ ' + uniqueNotes.join('<br>ℹ️ ') : ''}`, '#15803d');
+                return;
+            }
+            if (safeList.length === 0 && unsafeList.length > 0) {
+                show(`⚠️ All ASINs are unsafe to override! Yet please check whether the proposed fee category is right.
+                    ${missingList.length ? '<br><br>⚠️ Not in cache: ' + missingList.join(', ') : ''}
+                    ${uniqueNotes.length ? '<br><br>ℹ️ ' + uniqueNotes.join('<br>ℹ️ ') : ''}`, '#d97706');
+                return;
+            }
+
+            show(`
+                ⚠️ Unsafe ASINs: <b>${unsafeList.join(', ')}</b>
+                ${missingList.length ? '<br>⚠️ Not in cache: ' + missingList.join(', ') : ''}
+                <br>✅ Safe ASINs: <b>${safeList.join(', ')}</b>
+                ${uniqueNotes.length ? '<br><br>ℹ️ ' + uniqueNotes.join('<br>ℹ️ ') : ''}
+            `, '#d97706');
+        }
+
+        // ─────────────────────────────────────────────────────
+        // CREATE UI
+        // ─────────────────────────────────────────────────────
+        function createUI() {
+            const old = document.getElementById('feeOverrideTool');
+            if (old) old.remove();
+
+            const box = document.createElement('div');
+            box.id = 'feeOverrideTool';
+            box.style.cssText = `
+                position:fixed; top:14px; right:14px; width:620px;
+                max-height:94vh; overflow:auto;
+                background:linear-gradient(180deg,#ffffff 0%,#f8fafc 100%);
+                border:1px solid #dbeafe; border-radius:18px; padding:18px;
+                z-index:999999; box-shadow:0 18px 40px rgba(0,0,0,0.18);
+                font-family:Inter,Segoe UI,Arial,sans-serif; font-size:14px; color:#111827;
+            `;
+
+            box.innerHTML = `
+                <!-- HEADER -->
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+                    <div>
+                        <div style="font-size:24px;font-weight:800;color:#111827;">Fee Override Decision Tool</div>
+                        <div style="font-size:12px;color:#6b7280;">Smart Fee Category Assessor · v13.0</div>
+                    </div>
+                    <div style="display:flex;gap:8px;">
+                        <button id="fotToggle" style="width:42px;height:42px;border:none;border-radius:12px;background:#2563eb;color:#fff;font-size:24px;cursor:pointer;font-weight:700;">−</button>
+                        <button id="fotClose"  style="width:42px;height:42px;border:none;border-radius:12px;background:#ef4444;color:#fff;font-size:22px;cursor:pointer;font-weight:700;">×</button>
+                    </div>
+                </div>
+
+                <div id="fotBody">
+
+                    <!-- TICKET INFO -->
+                    <div style="background:#f1f5f9;border:1px solid #e2e8f0;border-radius:14px;padding:14px;line-height:1.8;margin-bottom:14px;">
+                        <div><b style="color:#334155;">ASIN:</b> <span id="fotAsinVal">-</span></div>
+                        <div><b style="color:#334155;">Marketplace:</b> <span id="fotMpVal">-</span></div>
+                        <div><b style="color:#334155;">Proposed Fee:</b> <span id="fotPropVal">-</span></div>
+                        <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #cbd5e1;font-size:13px;line-height:1.7;color:#334155;">
+                            <b>ASIN Fee Details:</b>
+                            <div id="fotAsinDetailsContent" style="margin-top:6px;color:#475569;">Click Check Decision to load details.</div>
+                        </div>
+                    </div>
+
+                    <!-- STEP 1: DAILY BATCH UPLOAD -->
+                    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:14px;padding:14px;margin-bottom:12px;">
+                        <div style="font-weight:700;color:#15803d;margin-bottom:4px;">📂 Step 1 — Upload Daily ASIN Batch File</div>
+                        <div style="font-size:12px;color:#16a34a;margin-bottom:10px;">
+                            Upload the daily file with <b>ASIN</b> and <b>Marketplace_ID</b> columns (CSV format). Do this once every morning.
+                        </div>
+                        <input type="file" id="fotBatchFile" accept=".csv" style="margin-bottom:8px;">
+                        <div id="fotBatchCount" style="font-size:12px;color:#15803d;margin-bottom:8px;"></div>
+
+                        <button id="fotRunBatchBtn" style="
+                            width:100%;padding:11px;
+                            background:linear-gradient(135deg,#16a34a,#15803d);
+                            color:#fff;border:none;border-radius:10px;
+                            font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px;
+                        ">🚀 Run Batch DataCentral Query (Once for All Tickets)</button>
+
+                        <div id="fotBatchStatus" style="font-size:12px;min-height:18px;font-weight:600;word-break:break-word;"></div>
+                    </div>
+
+                    <!-- STEP 2: CACHE STATUS -->
+                    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:14px;padding:14px;margin-bottom:12px;">
+                        <div style="font-weight:700;color:#1d4ed8;margin-bottom:6px;">🗄️ Step 2 — ASIN Cache Status</div>
+                        <div id="fotCacheStatus" style="font-size:13px;font-weight:600;margin-bottom:8px;"></div>
+                        <button id="fotClearCacheBtn" class="fotMiniBtn" style="font-size:12px;">🗑️ Clear Cache</button>
+                        <button id="fotDownloadCacheBtn" class="fotMiniBtn" style="font-size:12px;margin-left:8px;">⬇️ Download Cache</button>
+
+                    </div>
+
+                    <!-- STEP 3: FEES MASTER FILE -->
+                    <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-bottom:14px;">
+                        <div style="font-weight:700;margin-bottom:4px;">📄 Step 3 — Fees Master File</div>
+                        <div style="font-size:12px;color:#6b7280;margin-bottom:8px;">Upload once — remembered across sessions. (CSV format only)</div>
+                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                            <input type="file" id="fotFeeFile" accept=".csv">
+                            <button id="fotClearFee" class="fotMiniBtn">Clear</button>
+                        </div>
+                        <div id="fotFeeStatus" style="color:#16a34a;font-size:12px;margin-top:8px;"></div>
+                    </div>
+
+                    <!-- STEP 4: ASIN PROCESSOR (BadCat & CRISP) -->
+                    <div style="background:#f0f4ff;border:1px solid #c7d2fe;border-radius:14px;padding:14px;margin-bottom:14px;">
+                        <div style="font-weight:700;color:#3730a3;margin-bottom:4px;">🔗 Step 4 — ASIN Processor</div>
+                        <div style="font-size:12px;color:#4338ca;margin-bottom:10px;">
+                            Open <b>BadCat</b> fee override tool or <b>CRISP</b> ASIN viewer directly for ticket ASINs. No juggling between tools!
+                        </div>
+                        <div id="fotMpDetected" style="
+                            font-size:13px;font-weight:600;color:#3730a3;
+                            background:#e0e7ff;border:1px solid #c7d2fe;
+                            border-radius:10px;padding:7px 12px;margin-bottom:10px;
+                        ">🌍 Marketplace: detecting...</div>
+                        <input type="hidden" id="fotMpSelect">
+                        <input type="hidden" id="fotRegion">
+                        <div id="fotAsinProcessorCount" style="font-size:12px;color:#666;margin-bottom:10px;"></div>
+                        <div style="font-size:12px;color:#4338ca;margin-bottom:6px;">
+    Or upload ASIN file: <input type="file" id="fotAsinFileInput" accept=".csv,.xlsx,.xls" style="font-size:11px;">
+</div>
+                        <div style="display:flex;gap:8px;">
+                            <button id="fotBadCatBtn" style="
+                                flex:1;padding:10px;background:#4CAF50;color:#fff;
+                                border:none;border-radius:10px;font-size:13px;
+                                font-weight:700;cursor:pointer;
+                            ">BadCat URLs</button>
+                            <button id="fotCrispBtn" style="
+                                flex:1;padding:10px;background:#2196F3;color:#fff;
+                                border:none;border-radius:10px;font-size:13px;
+                                font-weight:700;cursor:pointer;
+                            ">Open CRISP</button>
+                        </div>
+                    </div>
+
+                    <!-- CHECK DECISION -->
+                    <button id="fotRunBtn" style="
+                        width:100%;padding:14px;
+                        background:linear-gradient(135deg,#1677ff,#2563eb);
+                        color:#fff;border:none;border-radius:14px;
+                        font-size:18px;font-weight:700;cursor:pointer;
+                        box-shadow:0 10px 18px rgba(37,99,235,0.28);margin-bottom:14px;
+                    ">Check Decision</button>
+
+                    <!-- RESULT -->
+                    <div id="fotResult" style="
+                        background:#ffffff;border:1px solid #e5e7eb;
+                        border-radius:14px;padding:14px;min-height:56px;
+                        line-height:1.8;font-weight:700;white-space:normal;word-break:break-word;
+                    "></div>
+
+                </div>
+            `;
+
+            document.body.appendChild(box);
+
+            GM_addStyle(`
+                #feeOverrideTool .fotMiniBtn {
+                    padding:7px 12px;border:1px solid #cbd5e1;border-radius:10px;
+                    background:#f8fafc;cursor:pointer;font-weight:600;font-size:13px;
+                }
+                #feeOverrideTool .fotMiniBtn:hover { background:#e2e8f0; }
+                #feeOverrideTool::-webkit-scrollbar { width:8px; }
+                #feeOverrideTool::-webkit-scrollbar-thumb { background:#cbd5e1;border-radius:8px; }
+            `);
+
+            // Wire up events
+            document.getElementById('fotClose').onclick = () => box.remove();
+            document.getElementById('fotToggle').onclick = () => {
+                const body = document.getElementById('fotBody');
+                const btn = document.getElementById('fotToggle');
+                if (body.style.display === 'none') { body.style.display = 'block'; btn.textContent = '−'; }
+                else { body.style.display = 'none'; btn.textContent = '+'; }
+            };
+
+            document.getElementById('fotBatchFile').addEventListener('change', loadBatchFile);
+            document.getElementById('fotRunBatchBtn').onclick = runBatchHubble;
+            document.getElementById('fotClearCacheBtn').onclick = clearCache;
+            document.getElementById('fotDownloadCacheBtn').onclick = downloadCache;
+            document.getElementById('fotFeeFile').addEventListener('change', loadFeeFile);
+            document.getElementById('fotClearFee').onclick = clearFeeFile;
+            document.getElementById('fotAsinFileInput').addEventListener('change', fotHandleAsinFileUpload);
+            document.getElementById('fotBadCatBtn').onclick = fotProcessBadCat;
+            document.getElementById('fotCrispBtn').onclick = fotProcessCRISP;
+            document.getElementById('fotRunBtn').onclick = runLogic;
+            fotUpdateAsinCount();
+
+            updateFeeStatus();
+            updateCacheStatus();
+            readPage();
+        }
+
+        // ─────────────────────────────────────────────────────
+        // INIT
+        // ─────────────────────────────────────────────────────
+        async function init() {
+            await restoreAllSavedData();
+            createUI();
+
+            setInterval(() => {
+                if (location.href !== lastUrl) {
+                    lastUrl = location.href;
+                    createUI();
+                } else {
+                    readPage();
+                }
+            }, 1200);
+        }
+
+        init();
+    }
+
+
+    // =========================================================
+    //  CRISP SIDE
+    //  Auto-clicks Execute Query button on crisp.cors.amazon.dev
+    // =========================================================
+    function runCrispSide() {
+        async function crispMain() {
+            await sleep(3000);
+            // Find Execute Query button by confirmed id="executeQueryButton"
+            let btn = document.getElementById('executeQueryButton');
+            if (!btn) {
+                btn = [...document.querySelectorAll('button')]
+                    .find(b => (b.textContent || '').trim().toLowerCase().includes('execute query'));
+            }
+            if (btn) btn.click();
+        }
+
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+        crispMain();
+    }
+
+    // =========================================================
+    //  DataCentral SIDE
+    //  Runs silently on datacentral.a2z.com/workbench
+    // =========================================================
+    function runHubbleSide() {
+
+        async function hubbleMain() {
+            // Kill Leave site dialog immediately
+            window.onbeforeunload = null;
+            window.addEventListener('beforeunload', e => {
+                e.stopImmediatePropagation();
+            }, true);
+
+            // Watch for custom Leave modal and auto-click it
+            observeAndDismissLeaveModal();
+
+            // Wait for page to settle
+            await waitForPageReady();
+
+            // Check for pending job
+            const status = await GM_getValue('hubbleJob_status', '');
+            if (status !== 'pending') return;
+
+            const query = await GM_getValue('hubbleJob_query', '');
+            if (!query) {
+                await GM_setValue('hubbleJob_status', 'error');
+                await GM_setValue('hubbleJob_error', 'No query found in storage.');
+                window.close();
+                return;
+            }
+
+            try {
+                await GM_setValue('hubbleJob_status', 'running');
+
+                // Select Database = Casper (only once at start)
+                await fillDropdown('[data-cy="db-select-dropdown"]', 'Casper');
+                await sleep(2000);
+
+                // Wait for DataCentral to auto-fill the username after Casper is selected
+                // DataCentral automatically detects and populates the username field
+                // once the database is chosen — no manual input needed
+                await sleep(2000); // wait for auto-fill to complete
+
+// ── CHUNKED PROCESSING ───────────────────────────────────
+const CHUNK_SIZE = 50;
+const allPairs = JSON.parse(await GM_getValue('hubbleJob_pairs', '[]'));
+const allResults = new Map();
+let snapshotDay = '';
+
+// Sort pairs by marketplace_id so ASINs are spread evenly across chunks
+// This prevents one chunk from being heavy with unusual marketplaces
+const sortedPairs = [...allPairs].sort((a, b) => {
+    const mpA = parseInt(a.marketplace_id) || 0;
+    const mpB = parseInt(b.marketplace_id) || 0;
+    return mpA - mpB;
+});
+
+// Interleave ASINs from different marketplaces across chunks
+// Instead of sequential chunking, distribute round-robin style
+const interleaved = [];
+const byMarketplace = new Map();
+for (const pair of sortedPairs) {
+    if (!byMarketplace.has(pair.marketplace_id)) {
+        byMarketplace.set(pair.marketplace_id, []);
+    }
+    byMarketplace.get(pair.marketplace_id).push(pair);
+}
+// Round-robin fill
+const mpQueues = [...byMarketplace.values()];
+let remaining = true;
+while (remaining) {
+    remaining = false;
+    for (const queue of mpQueues) {
+        if (queue.length > 0) {
+            interleaved.push(queue.shift());
+            remaining = true;
+        }
+    }
+}
+
+const chunks = [];
+for (let i = 0; i < interleaved.length; i += CHUNK_SIZE) {
+    chunks.push(interleaved.slice(i, i + CHUNK_SIZE));
+}
+const totalChunks = chunks.length;
+
+for (let ci = 0; ci < totalChunks; ci++) {
+    const chunk = chunks[ci];
+
+    await GM_setValue('hubbleJob_status',
+        `running|chunk ${ci + 1} of ${totalChunks}`);
+
+    const chunkQuery = buildQueryWithOffset(chunk);
+    await injectQuery(chunkQuery);
+    await sleep(1500);
+    await clickRun();
+    await sleep(2000);
+
+    const chunkResults = await waitForResults();
+
+    if (!snapshotDay && chunkResults.length > 0) {
+        snapshotDay = chunkResults[0]?.snapshot_day || 'CURRENT_DATE - 4';
+    }
+
+    for (const row of chunkResults) {
+        allResults.set(row.asin + '|' + row.marketplace_id, row);
+    }
+
+    if (ci < totalChunks - 1) await sleep(10000);
+}
+
+const finalResults = [...allResults.values()];
+if (!finalResults.length) {
+    throw new Error('No results returned. Check snapshot_day or ASINs.');
+}
+                await GM_setValue('hubbleJob_snapshotDay', snapshotDay);
+                await GM_setValue('hubbleJob_result', JSON.stringify(finalResults));
+                await GM_setValue('hubbleJob_status', 'done');
+
+            } catch (err) {
+                await GM_setValue('hubbleJob_status', 'error');
+                await GM_setValue('hubbleJob_error', String(err));
+            }
+
+            await sleep(1200);
+            window.close();
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        // Build query with a specific snapshot offset (2, 3 or 4)
+        function buildQueryWithOffset(pairs) {
+    const inClause = pairs.map(p => `('${p.asin}', '${p.marketplace_id}')`).join(',\n');
+    const uniqueMarketplaces = [...new Set(pairs.map(p => p.marketplace_id))];
+    const mpClause = uniqueMarketplaces.map(mp => `'${mp}'`).join(', ');
+    return `WITH asin_data AS (
+    SELECT
+        marketplace_id,
+        snapshot_day,
+        asin,
+        gl_product_group,
+        trex_id,
+        catset_itk_set,
+        catset_bn_set,
+        fee_category_id,
+        decisiveid_type
+    FROM ANDES_EXT.SPS_TREX.D_ASIN_TO_FEE_CATEGORY_ID_WITH_CONTEXT
+    WHERE (asin, marketplace_id) IN (
+${inClause}
+) AND snapshot_day = CURRENT_DATE - 4
+),
+fee_cat_mapping AS (
+    SELECT
+        region_id,
+        marketplace_id,
+        fee_category_id,
+        fee_category_name,
+        status
+    FROM (
+        SELECT
+            region_id,
+            marketplace_id,
+            fee_category_id,
+            fee_category_name,
+            status,
+            ROW_NUMBER() OVER(PARTITION BY marketplace_id, fee_category_id
+                            ORDER BY effective_date DESC) as row_num
+        FROM andes.sps_trex.d_fee_categories
+        WHERE region_id IN (1, 2, 3)
+        AND marketplace_id IN (${mpClause})
+        AND status NOT IN ('INACTIVE')
+    )
+    WHERE row_num = 1
+        AND status NOT IN ('DELETED')
+)
+SELECT
+    a.marketplace_id,
+    a.asin,
+    a.snapshot_day,
+    a.fee_category_id,
+    f.fee_category_name,
+    a.decisiveid_type,
+    CASE
+        WHEN a.decisiveid_type = 'TREX' THEN 'TREX-based'
+        ELSE 'GL-based (Fallback)'
+    END as categorization_method,
+    a.trex_id,
+    a.gl_product_group,
+    a.catset_itk_set,
+    a.catset_bn_set
+FROM asin_data a
+LEFT JOIN fee_cat_mapping f
+    ON a.marketplace_id = f.marketplace_id
+    AND a.fee_category_id = f.fee_category_id
+ORDER BY a.marketplace_id, a.asin;`;
+}
+
+
+        function observeAndDismissLeaveModal() {
+            const observer = new MutationObserver(() => {
+                const leaveBtn = [...document.querySelectorAll('button')]
+                    .find(b => (b.textContent || '').trim().toLowerCase() === 'leave');
+                if (leaveBtn) leaveBtn.click();
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+        }
+
+        async function waitForPageReady() {
+            const MAX = 25000;
+            const POLL = 500;
+            let elapsed = 0;
+            while (elapsed < MAX) {
+                await sleep(POLL);
+                elapsed += POLL;
+                const dbInput = document.querySelector('[data-cy="db-select-dropdown"]');
+                if (dbInput) { await sleep(1000); return; }
+            }
+        }
+
+        async function fillDropdown(selector, value) {
+            const input = document.querySelector(selector);
+            if (!input) throw new Error('Dropdown not found: ' + selector);
+
+            input.focus();
+            await sleep(300);
+
+            const nativeInputSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value'
+            ).set;
+            nativeInputSetter.call(input, value);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            await sleep(1000);
+
+            for (let i = 0; i < 10; i++) {
+                await sleep(400);
+                const options = [...document.querySelectorAll(
+                    '[role="option"], [role="listbox"] div, .mantine-Select-item'
+                )];
+                const match = options.find(o =>
+                    (o.textContent || '').toLowerCase().includes(value.toLowerCase())
+                );
+                if (match) { match.click(); await sleep(500); return; }
+            }
+
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+            await sleep(500);
+        }
+
+        async function waitForEnabled(selector) {
+            const MAX = 10000;
+            const POLL = 500;
+            let elapsed = 0;
+            while (elapsed < MAX) {
+                await sleep(POLL);
+                elapsed += POLL;
+                const el = document.querySelector(selector);
+                if (el && !el.disabled) return;
+            }
+            throw new Error('Database User dropdown never became enabled.');
+        }
+
+        async function injectQuery(query) {
+            let injected = false;
+
+            try {
+                const aceContainer = document.querySelector('.ace_editor');
+                if (aceContainer && window.ace) {
+                    const editor = window.ace.edit(aceContainer);
+                    if (editor) { editor.setValue(query, -1); editor.focus(); injected = true; }
+                }
+            } catch (e) {}
+
+            if (!injected) {
+                try {
+                    const aceContainer = document.querySelector('.ace_editor');
+                    if (aceContainer?.env?.editor) {
+                        aceContainer.env.editor.setValue(query, -1);
+                        aceContainer.env.editor.focus();
+                        injected = true;
+                    }
+                } catch (e) {}
+            }
+
+            if (!injected) {
+    try {
+        const textarea = document.querySelector('.ace_editor textarea');
+        if (textarea) {
+            textarea.focus();
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, query);
+            injected = true;
+        }
+    } catch (e) {}
+}
+
+// Method 4: Firefox-specific — use InputEvent with insertText
+// Firefox deprecated execCommand but supports InputEvent properly
+if (!injected) {
+    try {
+        const textarea = document.querySelector('.ace_editor textarea');
+        if (textarea) {
+            textarea.focus();
+            // Select all existing content first
+            textarea.setSelectionRange(0, textarea.value.length);
+            // Use InputEvent which Firefox supports reliably
+            const inputEvent = new InputEvent('input', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertText',
+                data: query
+            });
+            // Clear and set via nativeInputValueSetter
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLTextAreaElement.prototype, 'value'
+            ).set;
+            nativeSetter.call(textarea, query);
+            textarea.dispatchEvent(inputEvent);
+            textarea.dispatchEvent(new Event('change', { bubbles: true }));
+            injected = true;
+        }
+    } catch (e) {}
+}
+
+// Method 5: Direct ACE session setValue via global ace instance
+if (!injected) {
+    try {
+        // Firefox sometimes exposes ace differently
+        const editors = window.ace && window.ace.require &&
+                        window.ace.require('ace/ace');
+        const aceContainer = document.querySelector('.ace_editor');
+        if (aceContainer) {
+            // Try getting editor via ace.edit with element id
+            const editorId = aceContainer.id;
+            if (editorId) {
+                const editor = window.ace.edit(editorId);
+                if (editor) {
+                    editor.session.setValue(query);
+                    editor.focus();
+                    injected = true;
+                }
+            }
+        }
+    } catch (e) {}
+}
+
+if (!injected) throw new Error('Could not inject query into ACE Editor.');
+        }
+
+        async function clickRun() {
+            let btn = null;
+
+            // Exact SVG path confirmed from inspect
+            const allPaths = [...document.querySelectorAll('path')];
+            const playPath = allPaths.find(p => (p.getAttribute('d') || '').startsWith('m11.596'));
+            if (playPath) {
+                let el = playPath;
+                while (el && el.tagName !== 'BUTTON' && el.tagName !== 'BODY') el = el.parentElement;
+                if (el?.tagName === 'BUTTON') btn = el;
+            }
+
+            if (!btn) {
+                btn = [...document.querySelectorAll('button, div[role="button"]')].find(b => {
+                    const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const title = (b.getAttribute('title') || '').toLowerCase();
+                    return aria.includes('run') || title.includes('run') ||
+                           aria.includes('execute') || title.includes('execute');
+                });
+            }
+
+            if (!btn) btn = document.querySelector('[data-cy*="run"], [data-cy*="execute"], [data-cy*="play"]');
+
+            if (!btn) {
+                btn = [...document.querySelectorAll('button')].find(b => {
+                    const rect = b.getBoundingClientRect();
+                    return rect.width > 0 && rect.width < 60 && b.querySelector('svg');
+                });
+            }
+
+            if (!btn) throw new Error('Could not find the Run button.');
+            btn.click();
+        }
+
+        // ── WAIT FOR INITIAL RESULTS TO APPEAR ───────────────────
+        async function waitForResults() {
+            const MAX_WAIT_MS = 2000000; // extended wait for large batch query
+            const POLL_MS = 2000;
+            let elapsed = 0;
+
+            // Step 1: Wait until at least some rows appear in the DOM
+            while (elapsed < MAX_WAIT_MS) {
+                await sleep(POLL_MS);
+                elapsed += POLL_MS;
+                const colInfo = getColumnIndices();
+                if (colInfo && getVisibleRows(colInfo).length > 0) break;
+            }
+
+            if (elapsed >= MAX_WAIT_MS) {
+                throw new Error('Timed out waiting for DataCentral query results.');
+            }
+
+            // Step 2: Extra wait for ALL rows to finish rendering
+            // DataCentral renders rows progressively — wait until row count
+            // stabilises (no new rows added for 3 consecutive checks)
+            let stableCount = 0;
+            let lastRowCount = 0;
+            while (stableCount < 2) {
+                await sleep(1000);
+                const colInfo = getColumnIndices();
+                const rowCount = colInfo ? getVisibleRows(colInfo).length : 0;
+                if (rowCount === lastRowCount && rowCount > 0) {
+                    stableCount++;
+                } else {
+                    stableCount = 0;
+                    lastRowCount = rowCount;
+                }
+            }
+
+            // Step 3: Now scroll through all rows to collect everything
+            // DataCentral uses virtual scrolling — only visible rows exist in DOM
+            const allResults = await scrapeAllRowsWithScroll();
+            return allResults;
+        }
+
+        // ── GET COLUMN INDICES FROM HEADER ────────────────────
+        function getColumnIndices() {
+            let mpColIndex = -1;
+            let asinColIndex = -1;
+            let catColIndex = -1;
+            let snapColIndex = -1;
+
+            const allCells = [...document.querySelectorAll('[role="columnheader"], [role="gridcell"]')];
+            for (const cell of allCells) {
+                const txt = (cell.textContent || '').trim().toUpperCase();
+                const colIndex = parseInt(cell.getAttribute('aria-colindex') || '-1', 10);
+                if (colIndex === -1) continue;
+                if (txt === 'MARKETPLACE_ID') mpColIndex = colIndex;
+                else if (txt === 'ASIN') asinColIndex = colIndex;
+                else if (txt === 'FEE_CATEGORY_NAME') catColIndex = colIndex;
+                else if (txt === 'SNAPSHOT_DAY') snapColIndex = colIndex;
+
+            }
+
+            if (mpColIndex === -1 || asinColIndex === -1 || catColIndex === -1) return null;
+            return { mpColIndex, asinColIndex, catColIndex, snapColIndex };
+        }
+
+        // ── GET CURRENTLY VISIBLE DATA ROWS ──────────────────
+        function getVisibleRows(colInfo) {
+            const { mpColIndex, asinColIndex, catColIndex, snapColIndex } = colInfo;
+            const results = [];
+            const allRows = [...document.querySelectorAll('[role="row"]')];
+
+            for (let i = 1; i < allRows.length; i++) {
+                const cells = [...allRows[i].querySelectorAll('[role="gridcell"]')];
+                const mpCell = cells.find(c => parseInt(c.getAttribute('aria-colindex')) === mpColIndex);
+                const asinCell = cells.find(c => parseInt(c.getAttribute('aria-colindex')) === asinColIndex);
+                const catCell = cells.find(c => parseInt(c.getAttribute('aria-colindex')) === catColIndex);
+                const snapCell = snapColIndex > -1 ? cells.find(c => parseInt(c.getAttribute('aria-colindex')) === snapColIndex) : null;
+
+                const marketplace_id = (mpCell?.textContent || '').trim();
+                const asin = (asinCell?.textContent || '').trim();
+                const fee_category_name = (catCell?.textContent || '').trim();
+                const snapshot_day = (snapCell?.textContent || '').trim();
+
+                if (asin && marketplace_id && asin !== 'ASIN') {
+                    results.push({ marketplace_id, asin, fee_category_name, snapshot_day });
+                }
+            }
+            return results;
+        }
+
+        // ── SCROLL THROUGH ALL ROWS TO BEAT VIRTUAL SCROLLING ─
+        // DataCentral uses virtual scrolling — only visible rows exist in DOM.
+        // We scroll step by step collecting rows as they appear.
+        async function scrapeAllRowsWithScroll() {
+            const collected = new Map(); // key = asin|marketplace_id → deduplicates
+            let noNewRowsCount = 0;
+            const MAX_NO_NEW = 8; // increased: stop after 8 consecutive scrolls with no new rows
+
+            // Find the scrollable results container — try multiple selectors
+            // DataCentral uses rdg (react-data-grid) class names
+            let gridEl = document.querySelector('.rdg');
+            if (!gridEl) gridEl = document.querySelector('[role="grid"]');
+            if (!gridEl) gridEl = document.querySelector('[role="treegrid"]');
+            if (!gridEl) gridEl = document.querySelector('[class*="rdg-"]');
+            // Additional fallback: find any scrollable div containing gridcells
+            if (!gridEl) {
+                const allDivs = [...document.querySelectorAll('div')];
+                gridEl = allDivs.find(d =>
+                    d.scrollHeight > d.clientHeight &&
+                    d.querySelector('[role="gridcell"]') !== null
+                );
+            }
+
+            if (!gridEl) {
+                // Last resort: grab whatever is visible right now
+                const colInfo = getColumnIndices();
+                if (!colInfo) return [];
+                const rows = getVisibleRows(colInfo);
+                rows.forEach(r => collected.set(r.asin + '|' + r.marketplace_id, r));
+                return [...collected.values()];
+            }
+
+            // Scroll to top first to ensure we start from beginning
+            gridEl.scrollTop = 0;
+            await sleep(600);
+
+            const scrollStep = 200; // smaller step = more reliable capture
+            let lastScrollTop = -1;
+            let samePositionCount = 0;
+
+            while (true) {
+                // Collect currently visible rows
+                const colInfo = getColumnIndices();
+                if (colInfo) {
+                    const visible = getVisibleRows(colInfo);
+                    let newCount = 0;
+                    for (const row of visible) {
+                        const key = row.asin + '|' + row.marketplace_id;
+                        if (!collected.has(key)) {
+                            collected.set(key, row);
+                            newCount++;
+                        }
+                    }
+                    noNewRowsCount = newCount === 0 ? noNewRowsCount + 1 : 0;
+                }
+
+                // Scroll down one step
+                gridEl.scrollTop += scrollStep;
+                await sleep(400); // wait longer for virtual DOM to re-render
+
+                const currentScrollTop = gridEl.scrollTop;
+
+                // Check if reached bottom (position unchanged)
+                if (currentScrollTop === lastScrollTop) {
+                    samePositionCount++;
+                    if (samePositionCount >= 3) {
+                        // Confirmed at bottom — do 2 final collects and break
+                        await sleep(800);
+                        const colInfoFinal = getColumnIndices();
+                        if (colInfoFinal) {
+                            const finalRows = getVisibleRows(colInfoFinal);
+                            finalRows.forEach(r => collected.set(r.asin + '|' + r.marketplace_id, r));
+                        }
+                        await sleep(500);
+                        const colInfoFinal2 = getColumnIndices();
+                        if (colInfoFinal2) {
+                            const finalRows2 = getVisibleRows(colInfoFinal2);
+                            finalRows2.forEach(r => collected.set(r.asin + '|' + r.marketplace_id, r));
+                        }
+                        break;
+                    }
+                } else {
+                    samePositionCount = 0;
+                }
+
+                lastScrollTop = currentScrollTop;
+
+                // Safety net: too many scrolls with no new rows
+                if (noNewRowsCount >= MAX_NO_NEW) break;
+            }
+
+            return [...collected.values()];
+        }
+
+        hubbleMain();
+    }
+    function runBadCatAutoFill() {
+    var caseId = GM_getValue('extractedCaseId', null);
+    var sellerId = GM_getValue('extractedSellerId', null);
+
+    if (!caseId && !sellerId) return;
+
+    var fillAttempts = 0;
+    var maxAttempts = 40;
+
+    var fillInterval = setInterval(function() {
+        fillAttempts++;
+
+        var caseIdField = document.getElementById('caseId') ||
+                          document.querySelector('input[data-placeholder="Enter Case ID"]');
+        var sellerIdField = document.getElementById('merchantId') ||
+                            document.querySelector('input[data-placeholder="Enter Merchant ID"]');
+
+        if (caseIdField || sellerIdField) {
+            if (caseId && caseIdField && !caseIdField.value) {
+                caseIdField.value = caseId;
+                caseIdField.dispatchEvent(new Event('input', { bubbles: true }));
+                caseIdField.dispatchEvent(new Event('change', { bubbles: true }));
+                caseIdField.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+            if (sellerId && sellerIdField && !sellerIdField.value) {
+                sellerIdField.value = sellerId;
+                sellerIdField.dispatchEvent(new Event('input', { bubbles: true }));
+                sellerIdField.dispatchEvent(new Event('change', { bubbles: true }));
+                sellerIdField.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+            if ((caseId && caseIdField) || (sellerId && sellerIdField)) {
+                clearInterval(fillInterval);
+            }
+        }
+        if (fillAttempts >= maxAttempts) clearInterval(fillInterval);
+    }, 500);
+}
+
+})();
